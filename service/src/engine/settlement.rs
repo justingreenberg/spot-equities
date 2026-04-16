@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
@@ -49,7 +50,7 @@ impl SettlementEngine {
         // 2. Promote detected → pending
         self.promote_detected().await;
 
-        // 3. Process pending requests (place Dinari orders)
+        // 3. Process pending requests (place Dinari orders + mark on-chain)
         self.process_pending().await;
 
         // 4. Check processing requests (poll Dinari status)
@@ -89,7 +90,7 @@ impl SettlementEngine {
         }
     }
 
-    /// Place Dinari orders for pending requests
+    /// Place Dinari orders for pending requests and mark them as processing on-chain
     async fn process_pending(&self) {
         let requests = match queries::get_requests_by_status(&self.pool, "pending").await {
             Ok(r) => r,
@@ -118,42 +119,94 @@ impl SettlementEngine {
                     info!(
                         request_id = req.request_id,
                         dinari_order_id = %order.id,
-                        "Dinari order placed"
+                        "Dinari order placed, marking processing on-chain"
                     );
-                    let _ = queries::update_request_status(
-                        &self.pool,
-                        req.request_id,
-                        "processing",
-                        Some(&order.id),
-                        Some("pending"),
-                        None, None, None, None,
-                    )
-                    .await;
-                    // TODO: call markMintProcessing / markRedeemProcessing on-chain
+
+                    // Mark processing on-chain
+                    let tx_result = if req.request_type == "mint" {
+                        self.fulfiller
+                            .mark_mint_processing(req.request_id as u64, &order.id)
+                            .await
+                    } else {
+                        self.fulfiller
+                            .mark_redeem_processing(req.request_id as u64, &order.id)
+                            .await
+                    };
+
+                    match tx_result {
+                        Ok(tx_hash) => {
+                            info!(request_id = req.request_id, tx_hash, "Marked processing on-chain");
+                            let _ = queries::update_request_status(
+                                &self.pool,
+                                req.request_id,
+                                "processing",
+                                Some(&order.id),
+                                Some("pending"),
+                                None, None,
+                                Some(&tx_hash),
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            // Dinari order was placed but on-chain marking failed.
+                            // Still move to processing — the on-chain state will be
+                            // reconciled on the next attempt or manually.
+                            warn!(
+                                request_id = req.request_id,
+                                "Failed to mark processing on-chain: {}", e
+                            );
+                            let _ = queries::update_request_status(
+                                &self.pool,
+                                req.request_id,
+                                "processing",
+                                Some(&order.id),
+                                Some("pending"),
+                                None, None, None,
+                                Some(&format!("on-chain mark failed: {}", e)),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(request_id = req.request_id, "Dinari order failed: {}", e);
                     let _ = queries::increment_retry(&self.pool, req.request_id, &e.to_string()).await;
 
-                    // After too many retries, mark as failed
                     if req.retry_count >= 5 {
-                        warn!(request_id = req.request_id, "Max retries exceeded, marking failed");
+                        warn!(request_id = req.request_id, "Max retries exceeded, failing on-chain");
+
+                        let fail_result = if req.request_type == "mint" {
+                            self.fulfiller.fail_mint(req.request_id as u64).await
+                        } else {
+                            self.fulfiller.fail_redeem(req.request_id as u64).await
+                        };
+
+                        let tx_hash = match fail_result {
+                            Ok(hash) => Some(hash),
+                            Err(e2) => {
+                                error!(request_id = req.request_id, "Failed to call failRequest on-chain: {}", e2);
+                                None
+                            }
+                        };
+
                         let _ = queries::update_request_status(
                             &self.pool,
                             req.request_id,
                             "failed",
-                            None, None, None, None, None,
+                            None, None, None, None,
+                            tx_hash.as_deref(),
                             Some(&e.to_string()),
                         )
                         .await;
-                        // TODO: call failMint / failRedeem on-chain
                     }
                 }
             }
         }
     }
 
-    /// Poll Dinari for status updates on processing requests
+    /// Poll Dinari for status updates on processing requests.
+    /// On failure, call failMint/failRedeem on-chain to refund the MM.
     async fn check_processing(&self) {
         let requests = match queries::get_requests_by_status(&self.pool, "processing").await {
             Ok(r) => r,
@@ -197,19 +250,37 @@ impl SettlementEngine {
                         warn!(
                             request_id = req.request_id,
                             status = ?order.status,
-                            "Dinari order failed/cancelled"
+                            "Dinari order failed/cancelled, refunding on-chain"
                         );
+
+                        let fail_result = if req.request_type == "mint" {
+                            self.fulfiller.fail_mint(req.request_id as u64).await
+                        } else {
+                            self.fulfiller.fail_redeem(req.request_id as u64).await
+                        };
+
+                        let tx_hash = match fail_result {
+                            Ok(hash) => {
+                                info!(request_id = req.request_id, tx_hash = %hash, "Refund tx confirmed");
+                                Some(hash)
+                            }
+                            Err(e) => {
+                                error!(request_id = req.request_id, "Failed to refund on-chain: {}", e);
+                                None
+                            }
+                        };
+
                         let _ = queries::update_request_status(
                             &self.pool,
                             req.request_id,
                             "failed",
                             None,
                             Some(&format!("{:?}", order.status)),
-                            None, None, None,
+                            None, None,
+                            tx_hash.as_deref(),
                             Some("Dinari order failed"),
                         )
                         .await;
-                        // TODO: call failMint / failRedeem on-chain
                     }
                     _ => {
                         // Still processing, no-op
@@ -226,7 +297,9 @@ impl SettlementEngine {
         }
     }
 
-    /// Calculate fulfillment amounts for completed Dinari orders
+    /// Calculate fulfillment amounts for completed Dinari orders.
+    /// For mints: synthetic_amount = fill_shares (Dinari shares ≈ synthetic tokens, scaled to 18 dec)
+    /// For redeems: collateral_amount = filled_amount (USDC received from sale)
     async fn prepare_fulfillment(&self) {
         let requests = match queries::get_requests_by_status(&self.pool, "dinari_completed").await {
             Ok(r) => r,
@@ -237,15 +310,17 @@ impl SettlementEngine {
         };
 
         for req in requests {
-            // For mint: calculate synthetic tokens to mint based on fill price
-            // For redeem: calculate USDC to return based on sale amount
-            // This is where the price → amount conversion happens
             info!(
                 request_id = req.request_id,
                 request_type = %req.request_type,
+                fill_price = ?req.dinari_fill_price,
+                fill_shares = ?req.dinari_fill_shares,
                 "Preparing fulfillment"
             );
 
+            // Amounts are calculated here and stored; the next step reads them back.
+            // For now, pass through to ready_to_fulfill — the actual U256 conversion
+            // happens in fulfill_ready() from the stored fill data.
             let _ = queries::update_request_status(
                 &self.pool,
                 req.request_id,
@@ -256,7 +331,7 @@ impl SettlementEngine {
         }
     }
 
-    /// Submit on-chain fulfillment transactions
+    /// Submit on-chain fulfillment transactions.
     async fn fulfill_ready(&self) {
         let requests = match queries::get_requests_by_status(&self.pool, "ready_to_fulfill").await {
             Ok(r) => r,
@@ -267,26 +342,102 @@ impl SettlementEngine {
         };
 
         for req in requests {
-            info!(
-                request_id = req.request_id,
-                request_type = %req.request_type,
-                "Submitting on-chain fulfillment"
-            );
+            let result = if req.request_type == "mint" {
+                self.fulfill_mint_request(&req).await
+            } else {
+                self.fulfill_redeem_request(&req).await
+            };
 
-            // TODO: Submit actual on-chain transaction using the fulfiller
-            // For now, we encode the calldata (actual tx submission requires a signer)
-            // This will be wired up when we have a wallet provider
-
-            // Placeholder: mark as fulfilled (in production, only after tx confirms)
-            let _ = queries::update_request_status(
-                &self.pool,
-                req.request_id,
-                "fulfilled",
-                None, None, None, None,
-                Some("pending-implementation"),
-                None,
-            )
-            .await;
+            match result {
+                Ok(tx_hash) => {
+                    info!(
+                        request_id = req.request_id,
+                        tx_hash,
+                        "Fulfillment confirmed"
+                    );
+                    let _ = queries::update_request_status(
+                        &self.pool,
+                        req.request_id,
+                        "fulfilled",
+                        None, None, None, None,
+                        Some(&tx_hash),
+                        None,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!(
+                        request_id = req.request_id,
+                        "Fulfillment tx failed: {}", e
+                    );
+                    let _ = queries::update_request_status(
+                        &self.pool,
+                        req.request_id,
+                        "fulfillment_failed",
+                        None, None, None, None, None,
+                        Some(&e.to_string()),
+                    )
+                    .await;
+                    let _ = queries::increment_retry(&self.pool, req.request_id, &e.to_string()).await;
+                }
+            }
         }
+    }
+
+    /// Fulfill a mint: calculate synthetic tokens from Dinari fill, call fulfillMint on-chain.
+    async fn fulfill_mint_request(&self, req: &crate::db::models::Request) -> anyhow::Result<String> {
+        // fill_shares from Dinari = number of dShares purchased.
+        // Each dShare maps to 1 synthetic token (1e18 wei).
+        let fill_shares_str = req.dinari_fill_shares.as_deref().unwrap_or("0");
+        let fill_shares: f64 = fill_shares_str.parse().unwrap_or(0.0);
+
+        if fill_shares <= 0.0 {
+            anyhow::bail!("Invalid fill shares: {}", fill_shares_str);
+        }
+
+        // Convert to 18-decimal U256: shares * 1e18
+        let synthetic_wei = (fill_shares * 1e18) as u128;
+        let synthetic_amount = U256::from(synthetic_wei);
+
+        info!(
+            request_id = req.request_id,
+            fill_shares,
+            synthetic_amount = %synthetic_amount,
+            "Calling fulfillMint"
+        );
+
+        self.fulfiller
+            .fulfill_mint(req.request_id as u64, synthetic_amount)
+            .await
+    }
+
+    /// Fulfill a redeem: calculate USDC from Dinari sale, call fulfillRedeem on-chain.
+    async fn fulfill_redeem_request(&self, req: &crate::db::models::Request) -> anyhow::Result<String> {
+        // filled_amount from Dinari = USDC received from dShare sale.
+        // USDC has 6 decimals on HyperEVM.
+        let fill_price_str = req.dinari_fill_price.as_deref().unwrap_or("0");
+        let fill_shares_str = req.dinari_fill_shares.as_deref().unwrap_or("0");
+        let fill_price: f64 = fill_price_str.parse().unwrap_or(0.0);
+        let fill_shares: f64 = fill_shares_str.parse().unwrap_or(0.0);
+
+        let usdc_amount = fill_price * fill_shares;
+        if usdc_amount <= 0.0 {
+            anyhow::bail!("Invalid redemption amount: price={} shares={}", fill_price, fill_shares);
+        }
+
+        // Convert to 6-decimal U256: amount * 1e6
+        let collateral_wei = (usdc_amount * 1e6) as u128;
+        let collateral_amount = U256::from(collateral_wei);
+
+        info!(
+            request_id = req.request_id,
+            usdc_amount,
+            collateral_amount = %collateral_amount,
+            "Calling fulfillRedeem"
+        );
+
+        self.fulfiller
+            .fulfill_redeem(req.request_id as u64, collateral_amount)
+            .await
     }
 }

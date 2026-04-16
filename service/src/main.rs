@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize components
     let listener = EventListener::new(provider, vault_address, pool.clone());
-    let fulfiller = Fulfiller::new(vault_address);
+    let fulfiller = Fulfiller::new(&config.hyperevm_rpc_url, vault_address, &config.operator_private_key)?;
+    info!("Operator wallet initialized");
+
     let settlement_engine = SettlementEngine::new(
         pool.clone(),
         listener,
