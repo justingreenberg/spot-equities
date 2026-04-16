@@ -1,0 +1,25 @@
+FROM ghcr.io/foundry-rs/foundry:latest
+
+USER root
+
+WORKDIR /contracts
+COPY contracts/foundry.toml contracts/remappings.txt ./
+COPY contracts/src ./src
+COPY contracts/test ./test
+COPY contracts/script ./script
+
+# Install Solidity dependencies (git already in image)
+RUN git config --global user.email "deploy@local" && \
+    git config --global user.name "deployer" && \
+    git init && git add -A && git commit -m "init" && \
+    forge install foundry-rs/forge-std && \
+    forge install OpenZeppelin/openzeppelin-contracts-upgradeable
+
+# Verify it compiles
+RUN forge build
+
+RUN mkdir -p /shared
+COPY docker/deploy.sh /deploy.sh
+RUN chmod +x /deploy.sh
+
+ENTRYPOINT ["/deploy.sh"]

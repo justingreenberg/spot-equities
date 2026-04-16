@@ -1,0 +1,39 @@
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil", "--host", "0.0.0.0", "--block-time", "2"]
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://localhost:8545"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  deployer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.deployer
+    user: root
+    depends_on:
+      anvil:
+        condition: service_healthy
+    volumes:
+      - shared:/shared
+
+  service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+    depends_on:
+      deployer:
+        condition: service_completed_successfully
+    ports:
+      - "3100:3100"
+    volumes:
+      - shared:/shared
+      - service-data:/data
+
+volumes:
+  shared:
+  service-data:
